@@ -23,6 +23,7 @@ local Config = {
     DeadZone          = 30,
     VisibleCheck      = true,
     SkipReload        = false,
+    AutoReload        = false,
     RapidFire         = false,
     RapidFireRate     = 12,
     AimPriority       = "Crosshair",
@@ -63,6 +64,11 @@ local refreshPlayersUI = nil
 
 local lmbDown = false
 local lmbGameplay = false
+
+-- auto reload vs skip reload: flaga zeby skip nie kasowal auto reloadu
+local autoReloadActive = false
+local autoReloadStart = 0
+local lastRapidReload = 0
 
 -- jesli watek nie ma capability Plugin, Instance.new wywala blad;
 -- wtedy menu/chamsy sa wylaczone, a ESP/aim/rapid dalej dzialaja
@@ -121,6 +127,7 @@ local function SaveConfig(force)
             DeadZone = Config.DeadZone,
             VisibleCheck = Config.VisibleCheck,
             SkipReload = Config.SkipReload,
+            AutoReload = Config.AutoReload,
             RapidFire = Config.RapidFire,
             RapidFireRate = Config.RapidFireRate,
             AimPriority = Config.AimPriority,
@@ -165,8 +172,9 @@ local function LoadConfig()
         if type(data.DeadZone) == "number" then Config.DeadZone = math.clamp(math.floor(data.DeadZone), 0, 200) end
         if type(data.VisibleCheck) == "boolean" then Config.VisibleCheck = data.VisibleCheck end
         if type(data.SkipReload) == "boolean" then Config.SkipReload = data.SkipReload end
+        if type(data.AutoReload) == "boolean" then Config.AutoReload = data.AutoReload end
         if type(data.RapidFire) == "boolean" then Config.RapidFire = data.RapidFire end
-        if type(data.RapidFireRate) == "number" then Config.RapidFireRate = math.clamp(math.floor(data.RapidFireRate), 2, 30) end
+        if type(data.RapidFireRate) == "number" then Config.RapidFireRate = math.clamp(math.floor(data.RapidFireRate), 2, 500) end
         if data.AimPriority == "Crosshair" or data.AimPriority == "Distance" then Config.AimPriority = data.AimPriority end
         if type(data.Friends) == "table" then
             local clean = {}
@@ -587,7 +595,10 @@ local function getReloadRemote()
 end
 
 local function updateSkipReload()
-    if not Config.SkipReload then wasReloading = false return end
+    if autoReloadActive and os.clock() - autoReloadStart > 6 then
+        autoReloadActive = false
+    end
+    if not Config.SkipReload and not Config.AutoReload then wasReloading = false return end
     local char = LocalPlayer.Character
     if not char then wasReloading = false return end
     local reloading = Camera:GetAttribute("ReloadStart") ~= nil
@@ -599,6 +610,12 @@ local function updateSkipReload()
             end
         end
     end
+    if not reloading and wasReloading then
+        autoReloadActive = false
+    end
+    if not Config.SkipReload then wasReloading = reloading return end
+    -- nie kasuj przeladowania wystartowanego przez auto reload
+    if autoReloadActive then wasReloading = reloading return end
     -- strzal tylko na zboczu (start przeladowania), zeby nie spamowac remote
     if reloading and not wasReloading then
         local rem = getReloadRemote()
@@ -607,12 +624,38 @@ local function updateSkipReload()
     wasReloading = reloading
 end
 
+local function tryAutoReload()
+    if not Config.AutoReload then return end
+    local now = os.clock()
+    if now - lastRapidReload > 0.5 then
+        lastRapidReload = now
+        autoReloadActive = true
+        autoReloadStart = now
+        local rem = getReloadRemote()
+        if rem then pcall(function() rem:FireServer() end) end
+    end
+end
+
+local function updateAutoReload()
+    if not Config.AutoReload then return end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not char or not hum or hum.Health <= 0 then return end
+    local tool = char:FindFirstChildOfClass("Tool")
+    if not tool then return end
+    if tool:GetAttribute("Reloading") == true then return end
+    local ammo = tool:GetAttribute("Ammo")
+    if typeof(ammo) ~= "number" or ammo > 0 then return end
+    local reserve = tool:GetAttribute("Reserve")
+    if typeof(reserve) == "number" and reserve < 1 then return end
+    tryAutoReload()
+end
+
 -- ============================================================
 -- RAPID FIRE (auto-ogien przytrzymanym LMB, legitne dane jak gun client)
 -- ============================================================
 local fireRemote = nil
 local lastRapidShot = 0
-local lastRapidReload = 0
 
 local function getFireRemote()
     if fireRemote and fireRemote.Parent then return fireRemote end
@@ -647,8 +690,11 @@ local function updateRapidFire()
     if not Config.RapidFire then rapidStatus = "OFF" return end
     if not lmbDown or not lmbGameplay then rapidStatus = "czekam na LMB" return end
     local now = os.clock()
-    local rate = math.clamp(Config.RapidFireRate or 12, 2, 30)
-    if now - lastRapidShot < 1 / rate then return end
+    local rate = math.clamp(Config.RapidFireRate or 12, 2, 500)
+    local interval = 1 / rate
+    -- po dluzszej przerwie nie nadrabiaj zaleglosci burstem
+    if now - lastRapidShot > 1 then lastRapidShot = now - interval end
+    if now - lastRapidShot < interval then return end
     local char = LocalPlayer.Character
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     if not char or not hum or hum.Health <= 0 then rapidStatus = "brak postaci" return end
@@ -659,12 +705,6 @@ local function updateRapidFire()
     local ammo = tool:GetAttribute("Ammo")
     if typeof(ammo) ~= "number" or ammo <= 0 then
         rapidStatus = "pusty magazynek"
-        -- pusty magazynek: auto reload (tylko gdy skip wylaczony), max 1x na 0.5s
-        if not Config.SkipReload and now - lastRapidReload > 0.5 then
-            lastRapidReload = now
-            local rem = getReloadRemote()
-            if rem then pcall(function() rem:FireServer() end) end
-        end
         return
     end
     local aimTraceMod, gunConfigMod = nil, nil
@@ -685,51 +725,57 @@ local function updateRapidFire()
     params.FilterDescendantsInstances = { char, Camera }
     params.CollisionGroup = "Bullet"
     params.IgnoreWater = true
-    local ok, hitPos, hit = pcall(function()
-        local res = workspace:Raycast(ray.Origin, ray.Direction * range, params)
-        if res then return res.Position, res end
-        return ray.Origin + ray.Direction * range, nil
-    end)
-    if not ok then rapidStatus = "blad raycast" return end
-    local muzzle = nil
-    pcall(function()
-        local handle = tool:FindFirstChild("Handle")
-        local head = char:FindFirstChild("Head")
-        if handle and handle:IsA("BasePart") then
-            local vm = Camera:FindFirstChild("ViewModel")
-            local vmHandle = vm and vm:FindFirstChild("Handle")
-            local use = (vmHandle and vmHandle:IsA("BasePart")) and vmHandle or handle
-            local tw, th = 4, 1
-            pcall(function() tw, th = tool.Size.X, tool.Size.Y end)
-            local off = tool:GetAttribute("Muzzle") or Vector3.new(-tw / 2, th * 0.34, 0)
-            muzzle = use.CFrame * (off * (use.Size.X / tw))
-        elseif head then
-            muzzle = head.Position
+    local sent = 0
+    while sent < 10 and os.clock() - lastRapidShot >= interval do
+        ray = Camera:ViewportPointToRay(vps.X / 2, vps.Y / 2)
+        local ok, hitPos, hit = pcall(function()
+            local res = workspace:Raycast(ray.Origin, ray.Direction * range, params)
+            if res then return res.Position, res end
+            return ray.Origin + ray.Direction * range, nil
+        end)
+        if not ok then rapidStatus = "blad raycast" break end
+        local muzzle = nil
+        pcall(function()
+            local handle = tool:FindFirstChild("Handle")
+            local head = char:FindFirstChild("Head")
+            if handle and handle:IsA("BasePart") then
+                local vm = Camera:FindFirstChild("ViewModel")
+                local vmHandle = vm and vm:FindFirstChild("Handle")
+                local use = (vmHandle and vmHandle:IsA("BasePart")) and vmHandle or handle
+                local tw, th = 4, 1
+                pcall(function() tw, th = tool.Size.X, tool.Size.Y end)
+                local off = tool:GetAttribute("Muzzle") or Vector3.new(-tw / 2, th * 0.34, 0)
+                muzzle = use.CFrame * (off * (use.Size.X / tw))
+            elseif head then
+                muzzle = head.Position
+            else
+                muzzle = hitPos
+            end
+        end)
+        if not muzzle then rapidStatus = "blad lufy" break end
+        local snapOk, snap = pcall(function() return aimTraceMod.Snapshot() end)
+        if not snapOk then rapidStatus = "blad Snapshot" break end
+        local rem = getFireRemote()
+        if not rem then rapidStatus = "brak Fire remote" break end
+        local okFire = pcall(function()
+            rem:FireServer(
+                hitPos,
+                muzzle,
+                snap,
+                aimTraceMod.CameraPosition(),
+                aimTraceMod.Report(snap, hitPos),
+                rapidHumanPart(hit and hit.Instance)
+            )
+        end)
+        if okFire then
+            lastRapidShot = lastRapidShot + interval
+            sent = sent + 1
+            rapidShots = rapidShots + 1
+            rapidStatus = "FIRE ok x" .. tostring(sent) .. " (ammo " .. tostring(ammo) .. ")"
         else
-            muzzle = hitPos
+            rapidStatus = "FireServer odrzucony"
+            break
         end
-    end)
-    if not muzzle then rapidStatus = "blad lufy" return end
-    local snapOk, snap = pcall(function() return aimTraceMod.Snapshot() end)
-    if not snapOk then rapidStatus = "blad Snapshot" return end
-    local rem = getFireRemote()
-    if not rem then rapidStatus = "brak Fire remote" return end
-    local okFire = pcall(function()
-        rem:FireServer(
-            hitPos,
-            muzzle,
-            snap,
-            aimTraceMod.CameraPosition(),
-            aimTraceMod.Report(snap, hitPos),
-            rapidHumanPart(hit and hit.Instance)
-        )
-    end)
-    if okFire then
-        rapidStatus = "FIRE ok (ammo " .. tostring(ammo) .. ")"
-        rapidShots = rapidShots + 1
-        lastRapidShot = now
-    else
-        rapidStatus = "FireServer odrzucony"
     end
 end
 
@@ -1218,8 +1264,9 @@ local function createMenu()
     createToggle(combatPage, "Aimlock", "Aimlock")
     createToggle(combatPage, "Wall Check", "VisibleCheck")
     createToggle(combatPage, "Skip Reload", "SkipReload")
+    createToggle(combatPage, "Auto Reload", "AutoReload")
     createToggle(combatPage, "Rapid Fire", "RapidFire")
-    createSlider(combatPage, "Fire Rate", "RapidFireRate", 2, 30, " /s")
+    createSlider(combatPage, "Fire Rate", "RapidFireRate", 2, 500, " /s")
     local rapidStatusLbl = Instance.new("TextLabel")
     rapidStatusLbl.Size = UDim2.new(1, 0, 0, 16)
     rapidStatusLbl.BackgroundTransparency = 1
@@ -1676,6 +1723,7 @@ track(RunService.RenderStepped:Connect(function()
         updateChams(player)
     end
     updateSkipReload()
+    updateAutoReload()
     updateRapidFire()
     if rapidLabel and rapidLabel.Parent and os.clock() - lastRapidUi > 0.2 then
         lastRapidUi = os.clock()
