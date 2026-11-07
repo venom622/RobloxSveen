@@ -21,6 +21,13 @@ local Config = {
     AimFOV            = 150,
     AimSmoothness     = 40,
     DeadZone          = 30,
+    VisibleCheck      = true,
+    SkipReload        = false,
+    AimPriority       = "Crosshair",
+    Friends           = {},
+    Chams             = false,
+    ChamsColor        = "Red",
+    ChamsTransparency = 50,
     AimKey            = Enum.KeyCode.E,
     MenuKey           = Enum.KeyCode.RightShift,
 }
@@ -45,6 +52,21 @@ local dragStartPos0   = nil
 local keybindButtons  = {}
 local bindingKey      = nil
 
+-- forward-deklaracje (uzywane wczesniej w Save/Load)
+local SerializeBind, DeserializeBind
+
+local FriendsSet = {}
+
+local refreshPlayersUI = nil
+
+local function rebuildFriendsSet()
+    table.clear(FriendsSet)
+    if type(Config.Friends) ~= "table" then Config.Friends = {} end
+    for _, n in ipairs(Config.Friends) do
+        if type(n) == "string" and n ~= "" then FriendsSet[n] = true end
+    end
+end
+
 -- ============================================================
 -- SAVE / LOAD (auto load + auto save do pliku)
 -- ============================================================
@@ -68,7 +90,7 @@ local function SaveConfig(force)
     local ok, err = pcall(function()
         if typeof(writefile) ~= "function" then return end
         local data = {
-            _v = 2,
+            _v = 3,
             Enabled = Config.Enabled,
             Box = Config.Box,
             Name = Config.Name,
@@ -81,6 +103,13 @@ local function SaveConfig(force)
             AimFOV = Config.AimFOV,
             AimSmoothness = Config.AimSmoothness,
             DeadZone = Config.DeadZone,
+            VisibleCheck = Config.VisibleCheck,
+            SkipReload = Config.SkipReload,
+            AimPriority = Config.AimPriority,
+            Friends = Config.Friends,
+            Chams = Config.Chams,
+            ChamsColor = Config.ChamsColor,
+            ChamsTransparency = Config.ChamsTransparency,
             AimKey = SerializeBind(Config.AimKey),
             MenuKey = SerializeBind(Config.MenuKey),
         }
@@ -109,17 +138,29 @@ local function LoadConfig()
         if type(data.AimFOV) == "number" then Config.AimFOV = math.clamp(math.floor(data.AimFOV), 50, 500) end
         if type(data.AimSmoothness) == "number" then
             local s = math.floor(data.AimSmoothness)
-            -- migracja starego zakresu 1-20 na 1-100
-            if s <= 20 and s >= 1 then
-                -- stary 5 ~= nowy 40, wiec skaluj x5 gdy wykryto stary zapis
-                -- (tylko jesli plik nie ma flagi v2)
-                if data._v ~= 2 then s = math.clamp(s * 5, 1, 100) end
+            -- migracja starego zakresu 1-20 na 1-100 (tylko pliki bez _v)
+            if data._v == nil and s <= 20 and s >= 1 then
+                s = math.clamp(s * 5, 1, 100)
             end
             Config.AimSmoothness = math.clamp(s, 1, 100)
         end
         if type(data.DeadZone) == "number" then Config.DeadZone = math.clamp(math.floor(data.DeadZone), 0, 200) end
+        if type(data.VisibleCheck) == "boolean" then Config.VisibleCheck = data.VisibleCheck end
+        if type(data.SkipReload) == "boolean" then Config.SkipReload = data.SkipReload end
+        if data.AimPriority == "Crosshair" or data.AimPriority == "Distance" then Config.AimPriority = data.AimPriority end
+        if type(data.Friends) == "table" then
+            local clean = {}
+            for _, n in ipairs(data.Friends) do
+                if type(n) == "string" and n ~= "" and #clean < 50 then clean[#clean + 1] = n end
+            end
+            Config.Friends = clean
+        end
+        if type(data.Chams) == "boolean" then Config.Chams = data.Chams end
+        if type(data.ChamsColor) == "string" then Config.ChamsColor = data.ChamsColor end
+        if type(data.ChamsTransparency) == "number" then Config.ChamsTransparency = math.clamp(math.floor(data.ChamsTransparency), 0, 90) end
         if type(data.AimKey) == "string" then Config.AimKey = DeserializeBind(data.AimKey, Config.AimKey) end
         if type(data.MenuKey) == "string" then Config.MenuKey = DeserializeBind(data.MenuKey, Config.MenuKey) end
+        rebuildFriendsSet()
     end)
 end
 
@@ -154,7 +195,7 @@ local function BindMatches(input, bind)
     return input.KeyCode == bind
 end
 
-local function SerializeBind(bind)
+SerializeBind = function(bind)
     if typeof(bind) ~= "EnumItem" then return "K:E" end
     if bind.EnumType == Enum.UserInputType then
         return "M:" .. bind.Name
@@ -162,7 +203,7 @@ local function SerializeBind(bind)
     return "K:" .. bind.Name
 end
 
-local function DeserializeBind(str, fallback)
+DeserializeBind = function(str, fallback)
     if type(str) == "string" then
         local prefix, name = str:match("^(%a):(.+)$")
         if prefix == "M" and name then
@@ -382,11 +423,35 @@ local function getAimPart(character)
     end
 end
 
+local aimRayParams = RaycastParams.new()
+aimRayParams.FilterType = Enum.RaycastFilterType.Exclude
+aimRayParams.IgnoreWater = true
+
+local function isPartVisible(char, part)
+    if not Config.VisibleCheck then return true end
+    local origin = Camera.CFrame.Position
+    local targetPos = part.Position
+    local dir = targetPos - origin
+    local dist = dir.Magnitude
+    if dist < 1 then return true end
+    aimRayParams.FilterDescendantsInstances = {}
+    local lc = LocalPlayer.Character
+    if lc then aimRayParams.FilterDescendantsInstances = { lc } end
+    local ok, result = pcall(function()
+        return workspace:Raycast(origin, dir.Unit * dist, aimRayParams)
+    end)
+    if not ok then return true end
+    if not result then return true end
+    return result.Instance and result.Instance:IsDescendantOf(char) or false
+end
+
 local function getBestAimTarget()
     local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
-    local best, bestDist = nil, Config.AimFOV
+    local camPos = Camera.CFrame.Position
+    local useDist = Config.AimPriority == "Distance"
+    local best, bestScore = nil, nil
     for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer then
+        if player ~= LocalPlayer and not FriendsSet[player.Name] then
             local char = player.Character
             if char then
                 local hum = char:FindFirstChildOfClass("Humanoid")
@@ -396,9 +461,19 @@ local function getBestAimTarget()
                         local pos, onScreen = Camera:WorldToViewportPoint(part.Position)
                         if onScreen and pos.Z > 0 then
                             local d = (Vector2.new(pos.X, pos.Y) - center).Magnitude
-                            if d < bestDist then
-                                best = { part = part, head = char:FindFirstChild("Head"), character = char }
-                                bestDist = d
+                            if d < Config.AimFOV then
+                                local score
+                                if useDist then
+                                    score = (part.Position - camPos).Magnitude
+                                else
+                                    score = d
+                                end
+                                if bestScore == nil or score < bestScore then
+                                    if isPartVisible(char, part) then
+                                        best = { part = part, head = char:FindFirstChild("Head"), character = char }
+                                        bestScore = score
+                                    end
+                                end
                             end
                         end
                     end
@@ -415,6 +490,91 @@ local function distFromCenterOfPart(part)
     if not onScreen or pos.Z <= 0 then return math.huge end
     local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
     return (Vector2.new(pos.X, pos.Y) - center).Magnitude
+end
+
+-- ============================================================
+-- CHAMS (Highlight przez sciany)
+-- ============================================================
+local CHAMS_COLORS = {
+    Red    = Color3.fromRGB(255, 60, 60),
+    Green  = Color3.fromRGB(60, 255, 120),
+    Blue   = Color3.fromRGB(80, 140, 255),
+    Yellow = Color3.fromRGB(255, 220, 60),
+    Pink   = Color3.fromRGB(255, 80, 200),
+    Cyan   = Color3.fromRGB(60, 230, 255),
+    White  = Color3.fromRGB(240, 240, 240),
+}
+local CHAMS_COLOR_NAMES = { "Red", "Green", "Blue", "Yellow", "Pink", "Cyan", "White" }
+
+local chamsMap = {}
+
+local function updateChams(player)
+    local hl = chamsMap[player]
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not Config.Chams or not char or not hum or hum.Health <= 0 then
+        if hl then hl.Enabled = false end
+        return
+    end
+    if not hl or hl.Parent == nil or hl.Adornee ~= char then
+        if hl then pcall(function() hl:Destroy() end) end
+        hl = Instance.new("Highlight")
+        hl.Name = "SveenChams"
+        hl.Adornee = char
+        hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        hl.Parent = char
+        chamsMap[player] = hl
+    end
+    hl.FillColor = CHAMS_COLORS[Config.ChamsColor] or CHAMS_COLORS.Red
+    hl.FillTransparency = math.clamp(Config.ChamsTransparency or 50, 0, 90) / 100
+    hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+    hl.OutlineTransparency = 0
+    hl.Enabled = true
+end
+
+local function removeChams(player)
+    local hl = chamsMap[player]
+    if hl then pcall(function() hl:Destroy() end) end
+    chamsMap[player] = nil
+end
+
+-- ============================================================
+-- SKIP RELOAD (auto anulowanie przeladowania: Reload:FireServer(true))
+-- ============================================================
+local reloadRemote = nil
+local wasReloading = false
+
+local function getReloadRemote()
+    if reloadRemote and reloadRemote.Parent then return reloadRemote end
+    reloadRemote = nil
+    pcall(function()
+        local folder = game:GetService("ReplicatedStorage"):WaitForChild("GunRemotes", 5)
+        if folder then
+            reloadRemote = folder:WaitForChild("Reload", 5)
+        end
+    end)
+    return reloadRemote
+end
+
+local function updateSkipReload()
+    if not Config.SkipReload then wasReloading = false return end
+    local char = LocalPlayer.Character
+    if not char then wasReloading = false return end
+    local reloading = Camera:GetAttribute("ReloadStart") ~= nil
+    if not reloading then
+        for _, tool in ipairs(char:GetChildren()) do
+            if tool:IsA("Tool") and tool:GetAttribute("Reloading") == true then
+                reloading = true
+                break
+            end
+        end
+    end
+    -- strzal tylko na zboczu (start przeladowania), zeby nie spamowac remote
+    if reloading and not wasReloading then
+        local rem = getReloadRemote()
+        if rem then pcall(function() rem:FireServer(true) end) end
+    end
+    wasReloading = reloading
 end
 
 -- ============================================================
@@ -632,6 +792,30 @@ local function createKeybind(parent, text, key)
         bindingKey = key
         btn.Text = text .. ": [Press...]"
     end)
+end
+
+local function createTextbox(parent, placeholder)
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.new(1, 0, 0, 26)
+    box.BackgroundColor3 = Color3.fromRGB(22, 22, 24)
+    box.BorderSizePixel = 0
+    box.PlaceholderText = placeholder or "nick..."
+    box.PlaceholderColor3 = Color3.fromRGB(90, 90, 90)
+    box.Text = ""
+    box.TextColor3 = Color3.fromRGB(200, 200, 200)
+    box.TextSize = 11
+    box.Font = Enum.Font.Gotham
+    box.TextXAlignment = Enum.TextXAlignment.Left
+    box.TextTruncate = Enum.TextTruncate.AtEnd
+    box.ClearTextOnFocus = false
+    box.LayoutOrder = nextOrder(parent)
+    box.Parent = parent
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 4)
+    local pad = Instance.new("UIPadding")
+    pad.PaddingLeft = UDim.new(0, 8)
+    pad.PaddingRight = UDim.new(0, 8)
+    pad.Parent = box
+    return box
 end
 
 local function createSectionLabel(parent, text)
@@ -868,16 +1052,210 @@ local function createMenu()
     createToggle(visualsPage, "Skeleton", "Skeleton")
     createSectionLabel(visualsPage, "SKELETON")
     createSlider(visualsPage, "Thickness", "SkeletonThickness", 1, 5)
+    createSectionLabel(visualsPage, "CHAMS")
+    createToggle(visualsPage, "Chams", "Chams")
+    createDropdown(visualsPage, "Chams Color", "ChamsColor", CHAMS_COLOR_NAMES)
+    createSlider(visualsPage, "Chams Fill", "ChamsTransparency", 0, 90, "%")
 
     -- COMBAT
     createSectionLabel(combatPage, "AIMLOCK")
     createToggle(combatPage, "Aimlock", "Aimlock")
+    createToggle(combatPage, "Wall Check", "VisibleCheck")
+    createToggle(combatPage, "Skip Reload", "SkipReload")
     createDropdown(combatPage, "Aim Part", "AimPart", {"Head", "Torso"})
+    createDropdown(combatPage, "Priority", "AimPriority", {"Crosshair", "Distance"})
     createSlider(combatPage, "Aim FOV", "AimFOV", 50, 500)
     createSlider(combatPage, "Smoothness", "AimSmoothness", 1, 100)
     createSlider(combatPage, "Dead Zone", "DeadZone", 0, 200, " px")
     createSectionLabel(combatPage, "BINDS")
     createKeybind(combatPage, "Aim Key", "AimKey")
+    createSectionLabel(combatPage, "FRIENDS (nie aimuje)")
+
+    local friendBox = createTextbox(combatPage, "Dokladny nick...")
+
+    local addFriendBtn = Instance.new("TextButton")
+    addFriendBtn.Size = UDim2.new(1, 0, 0, 26)
+    addFriendBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+    addFriendBtn.BorderSizePixel = 0
+    addFriendBtn.Text = "ADD FRIEND"
+    addFriendBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    addFriendBtn.TextSize = 11
+    addFriendBtn.Font = Enum.Font.GothamBold
+    addFriendBtn.LayoutOrder = nextOrder(combatPage)
+    addFriendBtn.Parent = combatPage
+    Instance.new("UICorner", addFriendBtn).CornerRadius = UDim.new(0, 4)
+
+    local friendsList = Instance.new("Frame")
+    friendsList.Name = "FriendsList"
+    friendsList.Size = UDim2.new(1, 0, 0, 0)
+    friendsList.AutomaticSize = Enum.AutomaticSize.Y
+    friendsList.BackgroundTransparency = 1
+    friendsList.BorderSizePixel = 0
+    friendsList.LayoutOrder = nextOrder(combatPage)
+    friendsList.Parent = combatPage
+    friendsList:SetAttribute("UIOrder", 0)
+    local friendsLayout = Instance.new("UIListLayout")
+    friendsLayout.Padding = UDim.new(0, 4)
+    friendsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    friendsLayout.Parent = friendsList
+
+    local function rebuildFriendsList()
+        for _, c in ipairs(friendsList:GetChildren()) do
+            if c:IsA("GuiObject") then c:Destroy() end
+        end
+        friendsList:SetAttribute("UIOrder", 0)
+        for _, fname in ipairs(Config.Friends) do
+            local row = makeRow(friendsList, 24)
+            local lbl = Instance.new("TextLabel")
+            lbl.Size = UDim2.new(1, -32, 1, 0)
+            lbl.BackgroundTransparency = 1
+            lbl.Text = fname
+            lbl.TextColor3 = Color3.fromRGB(140, 220, 140)
+            lbl.TextSize = 11
+            lbl.Font = Enum.Font.Gotham
+            lbl.TextXAlignment = Enum.TextXAlignment.Left
+            lbl.TextTruncate = Enum.TextTruncate.AtEnd
+            lbl.Parent = row
+            local xBtn = Instance.new("TextButton")
+            xBtn.Size = UDim2.new(0, 24, 0, 20)
+            xBtn.Position = UDim2.new(1, -24, 0.5, -10)
+            xBtn.BackgroundColor3 = Color3.fromRGB(60, 30, 30)
+            xBtn.BorderSizePixel = 0
+            xBtn.Text = "X"
+            xBtn.TextColor3 = Color3.fromRGB(255, 150, 150)
+            xBtn.TextSize = 11
+            xBtn.Font = Enum.Font.GothamBold
+            xBtn.AutoButtonColor = false
+            xBtn.Parent = row
+            Instance.new("UICorner", xBtn).CornerRadius = UDim.new(0, 4)
+            local victim = fname
+            xBtn.MouseButton1Click:Connect(function()
+                for i, n in ipairs(Config.Friends) do
+                    if n == victim then table.remove(Config.Friends, i) break end
+                end
+                rebuildFriendsSet()
+                rebuildFriendsList()
+                QueueSave()
+            end)
+        end
+    end
+
+    local function addFriendFromBox()
+        local raw = friendBox.Text or ""
+        local name = raw:match("^%s*(.-)%s*$")
+        if name == "" then return end
+        for _, n in ipairs(Config.Friends) do
+            if n == name then friendBox.Text = "" return end
+        end
+        if #Config.Friends >= 50 then return end
+        Config.Friends[#Config.Friends + 1] = name
+        friendBox.Text = ""
+        rebuildFriendsSet()
+        rebuildFriendsList()
+        QueueSave()
+    end
+
+    addFriendBtn.MouseButton1Click:Connect(addFriendFromBox)
+    friendBox.FocusLost:Connect(function(enterPressed)
+        if enterPressed then addFriendFromBox() end
+    end)
+
+    rebuildFriendsList()
+
+    createSectionLabel(combatPage, "PLAYERS (klik = friend)")
+
+    local refreshBtn = Instance.new("TextButton")
+    refreshBtn.Size = UDim2.new(1, 0, 0, 24)
+    refreshBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+    refreshBtn.BorderSizePixel = 0
+    refreshBtn.Text = "REFRESH LIST"
+    refreshBtn.TextColor3 = Color3.fromRGB(180, 180, 180)
+    refreshBtn.TextSize = 10
+    refreshBtn.Font = Enum.Font.GothamBold
+    refreshBtn.LayoutOrder = nextOrder(combatPage)
+    refreshBtn.Parent = combatPage
+    Instance.new("UICorner", refreshBtn).CornerRadius = UDim.new(0, 4)
+
+    local playersList = Instance.new("Frame")
+    playersList.Name = "PlayersList"
+    playersList.Size = UDim2.new(1, 0, 0, 0)
+    playersList.AutomaticSize = Enum.AutomaticSize.Y
+    playersList.BackgroundTransparency = 1
+    playersList.BorderSizePixel = 0
+    playersList.LayoutOrder = nextOrder(combatPage)
+    playersList.Parent = combatPage
+    playersList:SetAttribute("UIOrder", 0)
+    local playersLayout = Instance.new("UIListLayout")
+    playersLayout.Padding = UDim.new(0, 4)
+    playersLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    playersLayout.Parent = playersList
+
+    local function rebuildPlayersList()
+        for _, c in ipairs(playersList:GetChildren()) do
+            if c:IsA("GuiObject") then c:Destroy() end
+        end
+        playersList:SetAttribute("UIOrder", 0)
+        local all = Players:GetPlayers()
+        table.sort(all, function(a, b) return a.Name:lower() < b.Name:lower() end)
+        for _, p in ipairs(all) do
+            if p ~= LocalPlayer then
+                local pname = p.Name
+                local isF = FriendsSet[pname] == true
+                local row = makeRow(playersList, 24)
+                local lbl = Instance.new("TextLabel")
+                lbl.Size = UDim2.new(1, -32, 1, 0)
+                lbl.BackgroundTransparency = 1
+                if p.DisplayName ~= pname then
+                    lbl.Text = pname .. " (@" .. p.DisplayName .. ")"
+                else
+                    lbl.Text = pname
+                end
+                lbl.TextColor3 = isF and Color3.fromRGB(140, 220, 140) or Color3.fromRGB(180, 180, 180)
+                lbl.TextSize = 11
+                lbl.Font = Enum.Font.Gotham
+                lbl.TextXAlignment = Enum.TextXAlignment.Left
+                lbl.TextTruncate = Enum.TextTruncate.AtEnd
+                lbl.Parent = row
+                local tBtn = Instance.new("TextButton")
+                tBtn.Size = UDim2.new(0, 24, 0, 20)
+                tBtn.Position = UDim2.new(1, -24, 0.5, -10)
+                tBtn.BorderSizePixel = 0
+                if isF then
+                    tBtn.BackgroundColor3 = Color3.fromRGB(35, 120, 60)
+                    tBtn.Text = "✓"
+                    tBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+                else
+                    tBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+                    tBtn.Text = "+"
+                    tBtn.TextColor3 = Color3.fromRGB(180, 180, 180)
+                end
+                tBtn.TextSize = 11
+                tBtn.Font = Enum.Font.GothamBold
+                tBtn.AutoButtonColor = false
+                tBtn.Parent = row
+                Instance.new("UICorner", tBtn).CornerRadius = UDim.new(0, 4)
+                tBtn.MouseButton1Click:Connect(function()
+                    if FriendsSet[pname] then
+                        for i, n in ipairs(Config.Friends) do
+                            if n == pname then table.remove(Config.Friends, i) break end
+                        end
+                    else
+                        if #Config.Friends < 50 then
+                            Config.Friends[#Config.Friends + 1] = pname
+                        end
+                    end
+                    rebuildFriendsSet()
+                    rebuildFriendsList()
+                    rebuildPlayersList()
+                    QueueSave()
+                end)
+            end
+        end
+    end
+
+    refreshBtn.MouseButton1Click:Connect(function() rebuildPlayersList() end)
+    refreshPlayersUI = rebuildPlayersList
+    rebuildPlayersList()
 
     -- CONFIGS
     createSectionLabel(configsPage, "KEYBINDS")
@@ -968,6 +1346,7 @@ unload = function()
     Config.Aimlock = false
     aiming = false
     aimCFrame = nil
+    refreshPlayersUI = nil
     for _, conn in ipairs(connections) do pcall(function() conn:Disconnect() end) end
     connections = {}
     pcall(function() RunService:UnbindFromRenderStep("AimlockCam") end)
@@ -976,6 +1355,7 @@ unload = function()
     for _, p in ipairs(players) do removeESP(p) end
     pcall(function() fovCircle:Remove() end)
     pcall(function() deadZoneCircle:Remove() end)
+    for p in pairs(chamsMap) do removeChams(p) end
     if menuRef then pcall(function() menuRef:Destroy() end); menuRef = nil end
 end
 
@@ -986,8 +1366,15 @@ LoadConfig()
 createMenu()
 
 for _, player in ipairs(Players:GetPlayers()) do createESP(player) end
-track(Players.PlayerAdded:Connect(createESP))
-track(Players.PlayerRemoving:Connect(removeESP))
+track(Players.PlayerAdded:Connect(function(p)
+    createESP(p)
+    if refreshPlayersUI then pcall(refreshPlayersUI) end
+end))
+track(Players.PlayerRemoving:Connect(function(p)
+    removeESP(p)
+    removeChams(p)
+    if refreshPlayersUI then pcall(refreshPlayersUI) end
+end))
 
 track(UserInputService.InputBegan:Connect(function(input, gp)
     if gp then return end
@@ -1098,7 +1485,9 @@ track(RunService.RenderStepped:Connect(function()
     end
     for player, esp in pairs(espObjects) do
         if player.Parent then updateESP(player, esp) else removeESP(player) end
+        updateChams(player)
     end
+    updateSkipReload()
     local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
     if Config.Aimlock then
         fovCircle.Position = center
